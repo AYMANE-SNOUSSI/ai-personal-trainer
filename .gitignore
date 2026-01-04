@@ -1,0 +1,13 @@
+# Fichiers Python temporaires
+__pycache__/
+*.py[cod]
+
+# Vidéos (Trop lourd pour GitHub)
+*.mp4
+*.avi
+# Sauf si tu veux garder la vidéo démo knee_pushup.mp4, mais en général on évite.
+# On garde le GIF par contre !
+
+# Fichiers système
+.DS_Store
+Thumbs.db
