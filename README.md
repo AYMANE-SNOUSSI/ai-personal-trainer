@@ -115,6 +115,7 @@ six seconds. Between repeats the coach simply counts: *"That's 3."*
 
 ![Squats](assets/squat.gif)
 
+![Shoulder press](assets/press.gif)
 ## Run it
 
 ```bash
