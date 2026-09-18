@@ -11,3 +11,14 @@ __pycache__/
 # Fichiers système
 .DS_Store
 Thumbs.db
+# Model weights (downloaded automatically by ultralytics)
+*.pt
+
+# Environment and outputs
+.venv/
+runs/
+.pytest_cache/
+*.task
+
+# Test clips (download links are in the README)
+data/

@@ -1,5 +1,5 @@
-streamlit
-ultralytics
-opencv-python
-numpy
-imageio
+ultralytics>=8.1
+opencv-python>=4.8
+numpy>=1.26
+streamlit>=1.30
+pytest>=8.0

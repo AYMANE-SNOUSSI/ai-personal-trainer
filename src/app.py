@@ -1,188 +1,148 @@
-import streamlit as st
-import cv2
-import numpy as np
+"""Streamlit front end: same coach engine, live from a webcam.
+
+    streamlit run src/app.py
+"""
+from __future__ import annotations
+
+import tempfile
 import time
-from ultralytics import YOLO
-import winsound
+from pathlib import Path
 
-# --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Coach IA", layout="wide")
+import cv2
+import streamlit as st
 
-# --- PARAMÈTRES (CONSTANTES) ---
-MODEL_PATH = 'models/yolov8n-pose.pt' 
-ARM_ANGLE_DOWN = 110    # Angle un peu plus large pour faciliter la détection en bas
-ARM_ANGLE_UP = 150      
-ANGLE_DOS_MIN = 140
-ANGLE_DOS_MAX = 220
+from coach import EXERCISES, RepCounter
+from coach.feedback import LiveCoach
+from detectors import MediaPipeDetector, YoloDetector, facing_camera, joints_outside_frame
+from draw import draw
 
-# Couleurs
-RED = (0, 0, 255)
-GREEN = (0, 255, 0)
-BLUE = (255, 0, 0)
-ORANGE = (0, 165, 255)
+st.set_page_config(page_title="AI Personal Trainer", layout="wide")
 
-# --- FONCTIONS ---
+PROCESS_WIDTH = 960          # pose models are run on a downscaled frame: a 4K frame is many times slower
+DISPLAY_EVERY = 2            # every frame is analysed; only every other one is sent to the browser
+DISPLAY_WIDTH = 720          # the browser preview is resized and JPEG-encoded: full-size PNG
+JPEG_QUALITY = 75            # was costing more time than the pose model itself
+
+
 @st.cache_resource
-def load_model():
-    return YOLO(MODEL_PATH)
+def load_detector(kind: str, imgsz: int, mp_model: str, max_poses: int):
+    return MediaPipeDetector(mp_model, max_poses=max_poses) if kind == "mediapipe" else YoloDetector(imgsz=imgsz)
 
-def calculate_angle(a, b, c):
-    a, b, c = np.array(a), np.array(b), np.array(c)
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
-    angle = np.abs(radians*180.0/np.pi)
-    if angle > 180.0: angle = 360 - angle
-    return angle
 
-# --- INTERFACE UTILISATEUR ---
-st.title("🏋️‍♂️ Assistant Coach Sportif IA - V3 (Correctif)")
+def show_summary(counter: RepCounter) -> None:
+    summary = counter.summary()
+    messages = counter.messages()
+    st.subheader("Session summary")
+    a, b, c = st.columns(3)
+    a.metric("Repetitions", summary["reps"])
+    b.metric("Clean repetitions", summary["clean_reps"])
+    c.metric("Half repetitions", summary["partial_reps"])
+    if summary["faults"]:
+        st.write("What to work on:")
+        for name, count in sorted(summary["faults"].items(), key=lambda kv: -kv[1]):
+            st.write(f"- {messages[name]} ({count} of {summary['reps']} repetitions)")
+    elif summary["reps"]:
+        st.success("No form problem detected on any repetition.")
+    with st.expander("Details of each repetition"):
+        st.caption("Deepest point: the smallest joint angle reached in the repetition. "
+                   "A smaller number means you went further down.")
+        st.table([{"#": r.index, "when": f"{r.start:.1f}s to {r.end:.1f}s",
+                   "deepest point": f"{r.min_angle:.0f}\u00b0",
+                   "form": "OK" if r.clean else ", ".join(messages[f].rstrip(".") for f in r.faults)}
+                  for r in counter.reps])
 
-# Barre latérale
-st.sidebar.header("Réglages")
-cam_source = st.sidebar.radio("Source Caméra", ["Webcam (Index 2)", "Webcam (Index 0)", "DroidCam IP"])
 
-# Curseur connecté à TOUT le code maintenant
-confidence = st.sidebar.slider("Sensibilité IA (Baisser si lignes disparaissent)", 0.0, 1.0, 0.25)
+st.title("AI Personal Trainer")
 
-start_button = st.sidebar.button("Démarrer", type="primary")
-stop_button = st.sidebar.button("Arrêter")
+with st.sidebar:
+    exercise = st.selectbox("Exercise", sorted(EXERCISES))
+    source_kind = st.radio("Video source", ["Webcam", "Video file"])
+    upload = st.file_uploader("Your video", type=["mp4", "mov", "avi"]) if source_kind == "Video file" else None
+    with st.expander("Advanced"):
+        kind = st.radio("Pose detector", ["mediapipe", "yolo"],
+                        help="MediaPipe is about six times faster on CPU and tracks one person.")
+        imgsz = st.select_slider("YOLO input size", [320, 480, 640], value=640) if kind == "yolo" else 640
+        camera = st.number_input("Camera index", min_value=0, max_value=5, value=0, step=1,
+                                 help="0 is usually the built-in webcam; try 1 or 2 if it fails.")
+        crowded = st.checkbox("Other people in shot (slower)",
+                              help="Detects up to three people and keeps the one closest to the camera.")
+    if st.button("Start", type="primary"):
+        st.session_state.running = True
+    if st.button("Stop"):
+        st.session_state.running = False
 
 col_video, col_stats = st.columns([3, 1])
-
+frame_slot = col_video.empty()
 with col_stats:
-    st.markdown("### 📊 Performances")
-    # Plus de message "En Pause", direct le compteur
-    kpi_counter = st.empty()
-    kpi_status = st.empty()
-    kpi_feedback = st.empty()
-    st.markdown("---")
-    kpi_debug = st.empty()
+    reps_slot, state_slot, message_slot, speed_slot = st.empty(), st.empty(), st.empty(), st.empty()
 
-with col_video:
-    frame_placeholder = st.empty()
-
-# --- BOUCLE PRINCIPALE ---
-if start_button:
-    model = load_model()
-    
-    if cam_source == "Webcam (Index 2)":
-        cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
-    elif cam_source == "Webcam (Index 0)":
-        cap = cv2.VideoCapture(0)
+if st.session_state.get("running"):
+    detector = load_detector(kind, imgsz, "pose_landmarker_full.task", 3 if crowded else 1)
+    counter = RepCounter(EXERCISES[exercise])
+    coach = LiveCoach(counter.messages())
+    if upload is not None:
+        path = Path(tempfile.gettempdir()) / f"coach_upload{Path(upload.name).suffix}"
+        path.write_bytes(upload.getbuffer())
+        cap, live = cv2.VideoCapture(str(path)), False
     else:
-        cap = cv2.VideoCapture('http://192.168.1.XX:4747/video')
-
-    counter = 0
-    stage = "UP"
-    posture_correcte = True
-    feedback_message = ""
-    feedback_timer = 0
-
-    while cap.isOpened() and not stop_button:
-        ret, frame = cap.read()
-        if not ret:
-            st.error("Erreur de lecture caméra.")
-            break
-
-        # Analyse IA
-        results = model(frame, verbose=False, conf=confidence)
-        
-        keypoints_data = None
-        max_area = 0
-        
-        if results[0].boxes is not None:
-            for i, box in enumerate(results[0].boxes):
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                area = (x2 - x1) * (y2 - y1)
-                if area > max_area:
-                    max_area = area
-                    keypoints_data = results[0].keypoints.data[i].cpu().numpy()
-
-        if keypoints_data is not None:
-            # Choix côté
-            conf_left = keypoints_data[5][2]
-            conf_right = keypoints_data[6][2]
-            
-            if conf_right > conf_left:
-                side = "DROIT"
-                idx_s, idx_e, idx_w, idx_h, idx_k = 6, 8, 10, 12, 14
-            else:
-                side = "GAUCHE"
-                idx_s, idx_e, idx_w, idx_h, idx_k = 5, 7, 9, 11, 13
-
-            p_shoulder = keypoints_data[idx_s][:2]
-            p_elbow    = keypoints_data[idx_e][:2]
-            p_wrist    = keypoints_data[idx_w][:2]
-            p_hip      = keypoints_data[idx_h][:2]
-            p_knee     = keypoints_data[idx_k][:2]
-            
-            # --- CORRECTION MAJEURE ICI ---
-            # On utilise la variable 'confidence' du curseur au lieu de 0.5 fixe
-            seuil_detection = confidence 
-
-            # On vérifie si on voit Épaule, Hanche, Genou
-            if keypoints_data[idx_s][2] > seuil_detection and \
-               keypoints_data[idx_h][2] > seuil_detection and \
-               keypoints_data[idx_k][2] > seuil_detection:
-                
-                # 1. DOS
-                angle_back = calculate_angle(p_shoulder, p_hip, p_knee)
-                if ANGLE_DOS_MIN < angle_back < ANGLE_DOS_MAX:
-                    posture_correcte = True
-                    color_spine = GREEN
-                    status_msg = "DOS OK"
+        cap, live = cv2.VideoCapture(int(camera)), True
+    if not cap.isOpened():
+        st.error("Cannot open the video source. For a webcam, try another camera index under Advanced.")
+    else:
+        t0, frames, last_report, outside, front = time.perf_counter(), 0, 0.0, 0, 0
+        try:
+            # Pressing Stop reruns the script, which ends this loop with running set to False.
+            while cap.isOpened() and st.session_state.get("running"):
+                ok, frame = cap.read()
+                if not ok:
+                    if live:
+                        st.error("Lost the camera feed.")
+                    break
+                if frame.shape[1] > PROCESS_WIDTH:
+                    fh, fw = frame.shape[:2]
+                    frame = cv2.resize(frame, (PROCESS_WIDTH, int(fh * PROCESS_WIDTH / fw)),
+                                       interpolation=cv2.INTER_AREA)
+                if live:
+                    frame = cv2.flip(frame, 1)             # mirror, so left and right feel natural
+                    t = time.perf_counter() - t0
                 else:
-                    posture_correcte = False
-                    color_spine = RED
-                    status_msg = "DOS CREUSÉ !"
+                    t = frames / (cap.get(cv2.CAP_PROP_FPS) or 25.0)
+                t_det = time.perf_counter()
+                kp = detector(frame)
+                infer_ms = 1000 * (time.perf_counter() - t_det)
+                res = counter.update(kp, t)
+                coach.update(res)
+                draw(frame, kp, res, counter, coach.current)
+                outside += joints_outside_frame(kp, frame.shape) > 0
+                front += facing_camera(kp) is True
+                h, w = frame.shape[:2]
+                preview = cv2.resize(frame, (DISPLAY_WIDTH, int(h * DISPLAY_WIDTH / w))) if w > DISPLAY_WIDTH else frame
+                if frames % DISPLAY_EVERY == 0:
+                    ok_jpg, buf = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                    if ok_jpg:
+                        frame_slot.image(buf.tobytes(), use_container_width=True)
 
-                # 2. COMPTEUR (Plus de blocage "Debout")
-                # On vérifie juste si on voit le bras
-                if keypoints_data[idx_e][2] > seuil_detection and keypoints_data[idx_w][2] > seuil_detection:
-                    angle_arm = calculate_angle(p_shoulder, p_elbow, p_wrist)
-                    
-                    # LOGIQUE HAUT/BAS
-                    if angle_arm < ARM_ANGLE_DOWN:
-                        stage = "DOWN"
-                    
-                    if angle_arm > ARM_ANGLE_UP and stage == "DOWN":
-                        if posture_correcte:
-                            counter += 1
-                            feedback_message = "GOOD REP! ✅"
-                            try: winsound.Beep(1500, 100) 
-                            except: pass
-                        else:
-                            feedback_message = "MAUVAISE FORME ❌"
-                            try: winsound.Beep(400, 300) 
-                            except: pass
-                        
-                        stage = "UP"
-                        feedback_timer = time.time()
-
-                    # Dessin Bras
-                    color_arm = BLUE if stage == "UP" else ORANGE
-                    cv2.line(frame, (int(p_shoulder[0]), int(p_shoulder[1])), (int(p_elbow[0]), int(p_elbow[1])), color_arm, 4)
-                    cv2.line(frame, (int(p_elbow[0]), int(p_elbow[1])), (int(p_wrist[0]), int(p_wrist[1])), color_arm, 4)
-                    
-                    # Debug Angle
-                    kpi_debug.info(f"Angle Bras: {int(angle_arm)}°")
-
-                # Dessin Dos
-                cv2.line(frame, (int(p_shoulder[0]), int(p_shoulder[1])), (int(p_hip[0]), int(p_hip[1])), color_spine, 4)
-                cv2.line(frame, (int(p_hip[0]), int(p_hip[1])), (int(p_knee[0]), int(p_knee[1])), color_spine, 4)
-
-                # UPDATE INTERFACE
-                kpi_counter.metric(label="Répétitions", value=counter, delta=stage)
-                if posture_correcte:
-                    kpi_status.success(f"Posture : {status_msg}")
+                summary = counter.summary()
+                reps_slot.metric("Repetitions", summary["reps"], f"{summary['clean_reps']} clean")
+                state_slot.info(f"State: {res.phase}" + ("" if res.visible else " (body not visible)"))
+                if coach.current is None:
+                    message_slot.empty()
+                elif coach.current.kind == "fault":
+                    message_slot.warning(coach.current.text)
                 else:
-                    kpi_status.error(f"Posture : {status_msg}")
-
-        if time.time() - feedback_timer < 2 and feedback_message != "":
-            kpi_feedback.markdown(f"## {feedback_message}")
-        else:
-            kpi_feedback.empty()
-
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-
-    cap.release()
+                    message_slot.success(coach.current.text)
+                frames += 1
+                if t - last_report > 1.0:                  # refresh the read-outs once a second
+                    speed_slot.caption(f"{infer_ms:.0f} ms of pose detection per frame, "
+                                       f"{frames / max(t, 1e-6):.0f} fps displayed")
+                    if outside > 0.2 * frames:
+                        state_slot.warning("Part of your body leaves the frame. Step back from the camera.")
+                    elif front > 0.5 * frames:
+                        state_slot.warning("Turn side-on to the camera: angles are measured from a side view.")
+                    last_report = t
+        finally:
+            cap.release()
+        st.session_state.running = False
+        show_summary(counter)
+else:
+    st.info("Pick an exercise and press Start. Film yourself from the side, with your whole body in view.")
